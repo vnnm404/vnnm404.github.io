@@ -6,22 +6,16 @@
       <description>Last 10 notes on vnnm</description>
       <generator>Quartz -- quartz.jzhao.xyz</generator>
       <item>
-    <title>The Translated Transformer</title>
-    <link>https://quartz.jzhao.xyz/Bytes/The-Translated-Transformer</link>
-    <guid>https://quartz.jzhao.xyz/Bytes/The-Translated-Transformer</guid>
-    <description>TODO.</description>
-    <pubDate>Tue, 19 Dec 2023 00:00:00 GMT</pubDate>
-  </item><item>
     <title>CV</title>
     <link>https://quartz.jzhao.xyz/CV</link>
     <guid>https://quartz.jzhao.xyz/CV</guid>
     <description>TODO.</description>
     <pubDate>Tue, 19 Dec 2023 00:00:00 GMT</pubDate>
   </item><item>
-    <title>Home</title>
+    <title>vnnm</title>
     <link>https://quartz.jzhao.xyz//</link>
     <guid>https://quartz.jzhao.xyz//</guid>
-    <description>I’m Sreeram Vennam, I go by vnnm on the internet. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Quisque ac orci et nunc aliquet rutrum eget vitae purus.</description>
+    <description>Hi! My name is Sreeram Vennam, but I go by vnnm on the internet (vennam -&gt; vxnnxm -&gt; vnnm). I mainly work in Machine Learning (愛) but I also enjoy low level programming and web-dev.</description>
     <pubDate>Mon, 18 Dec 2023 08:39:37 GMT</pubDate>
   </item>
     </channel>
