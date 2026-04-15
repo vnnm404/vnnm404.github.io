@@ -1,0 +1,159 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: "JetBrains Mono", "SF Mono", "Consolas", monospace;
+    background-color: #fff;
+    color: #111;
+    font-size: 14px;
+    line-height: 1.6;
+    padding: 30px 40px;
+    max-width: 1000px;
+    margin: 0 auto;
+}
+
+.man-header, .man-footer {
+    font-family: "JetBrains Mono", "SF Mono", "Consolas", monospace;
+    font-size: 14px;
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 20px;
+}
+
+.man-footer {
+    margin-top: 30px;
+    margin-bottom: 0;
+    border-top: none;
+    padding-top: 20px;
+}
+
+.man-title {
+    text-align: center;
+    font-weight: bold;
+}
+
+h1 {
+    font-family: "JetBrains Mono", "SF Mono", "Consolas", monospace;
+    font-size: 14px;
+    font-weight: bold;
+    text-transform: uppercase;
+    margin: 25px 0 5px 0;
+}
+
+.indent {
+    margin-left: 7ch;
+}
+
+.indent-2 {
+    margin-left: 14ch;
+}
+
+p {
+    margin-bottom: 10px;
+}
+
+/* Tighten spacing when paragraph is followed by list */
+p:has(+ ul), p:has(+ ol) {
+    margin-bottom: 5px;
+}
+
+.synopsis {
+    margin: 10px 0 10px 7ch;
+}
+
+.synopsis .cmd {
+    font-weight: bold;
+}
+
+.synopsis .arg {
+    font-style: italic;
+}
+
+a {
+    color: #111;
+    text-decoration: underline;
+}
+
+a:hover {
+    background-color: #111;
+    color: #fffff8;
+}
+
+dl {
+    margin-left: 7ch;
+}
+
+dt {
+    font-weight: bold;
+    margin-top: 10px;
+}
+
+dd {
+    margin-left: 7ch;
+    margin-bottom: 5px;
+}
+
+ul, ol {
+    list-style: none;
+    margin-left: 7ch;
+    margin-bottom: 10px;
+}
+
+ul li::before {
+    content: "·  ";
+}
+
+pre {
+    font-family: "JetBrains Mono", "SF Mono", "Consolas", monospace;
+    font-size: 13px;
+    background: #f0f0f0;
+    padding: 15px 20px;
+    margin: 10px 0 10px 7ch;
+    overflow-x: auto;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    display: block;
+}
+
+pre code {
+    background: none;
+    padding: 0;
+}
+
+code {
+    font-family: "JetBrains Mono", "SF Mono", "Consolas", monospace;
+    font-size: 0.9em;
+    background-color: #e8e8e3;
+    padding: 2px 6px;
+}
+
+img {
+    max-width: 100%;
+    margin: 15px 0 15px 7ch;
+    display: block;
+}
+
+table {
+    margin: 10px 0 10px 7ch;
+    border-collapse: collapse;
+}
+
+th, td {
+    text-align: left;
+    padding: 3px 15px 3px 0;
+}
+
+th {
+    font-weight: bold;
+    border-bottom: 1px solid #111;
+}
+
+.todo {
+    text-align: center;
+    margin: 60px 0;
+    color: #666;
+}

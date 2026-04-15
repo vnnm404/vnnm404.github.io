@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OMP0(418) - Milestone</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Source+Sans+Pro:wght@400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<div class="man-header">
+    <span>OMP0(418)</span>
+    <span class="man-title">Milestone</span>
+    <span>OMP0(418)</span>
+</div>
+
+<h1>TITLE</h1>
+<p class="indent">
+    <strong>omp0</strong> - a minimal OpenMP implementation
+</p>
+
+<h1>AUTHORS</h1>
+<p class="indent">
+    <a href="mailto:svennam@andrew.cmu.edu">Sreeram</a>,
+    <a href="mailto:bkomire@andrew.cmu.edu">Bhargav</a>
+</p>
+
+<h1>EXAMPLE</h1>
+<p class="indent">
+    Here's a taste of what omp0 code looks like:
+</p>
+<pre>
+#include &lt;omp0/runtime/runtime.hpp&gt;
+#include &lt;cstdio&gt;
+
+int main() {
+    omp0::RuntimeConfig cfg;
+    cfg.num_threads = 4;
+    cfg.lock        = omp0::LockKind::MCS;
+    cfg.barrier     = omp0::BarrierKind::Tree;
+    cfg.sched       = omp0::SchedKind::Dynamic;
+    omp0::Runtime rt(cfg);
+
+    int sum = 0;
+
+    // parallel_for with dynamic scheduling
+    rt.parallel_for(0, 100, [&](int i, int tid) {
+        int local = expensive_work(i);
+
+        // critical section protected by MCS lock
+        rt.critical([&]() { sum += local; });
+    });
+    // implicit tree barrier here
+
+    printf("sum = %d\n", sum);
+}
+</pre>
+<p class="indent">
+    One config struct controls everything: swap <code>MCS</code> for
+    <code>TTAS</code> or <code>Tree</code> for <code>Sense</code> and rerun,
+    no recompilation needed.
+</p>
+
+<h1>WORK COMPLETED SO FAR</h1>
+<p class="indent">
+    We have a working runtime library with most of the core primitives
+    implemented, tested, and benchmarked. The codebase is ~2,500 lines of C++20
+    across 30+ files with a clean CMake build system. All 54 unit tests pass
+    covering correctness of every component built so far.
+</p>
+<p class="indent">
+    <strong>Synchronization primitives:</strong> Five mutex implementations
+    (pthread_mutex, TAS, TTAS, ticket lock, MCS lock) and two barrier
+    implementations (centralized sense-reversing, tree barrier). All share
+    abstract base classes so the runtime can swap them at construction time.
+</p>
+<p class="indent">
+    <strong>Scheduling:</strong> Two loop schedulers: static (block
+    partitioning) and dynamic (shared atomic counter with configurable chunk
+    size).
+</p>
+<p class="indent">
+    <strong>Runtime:</strong> A persistent thread pool with mutex+condvar
+    sleep/wake. The <code>Runtime</code> class exposes <code>parallel()</code>,
+    <code>parallel_for()</code>, and <code>critical()</code>. Implementation
+    choices (lock kind, barrier kind, scheduler kind) are selected via a
+    <code>RuntimeConfig</code> struct and factory methods, so no recompilation
+    needed to swap algorithms.
+</p>
+<p class="indent">
+    <strong>Benchmarking infrastructure:</strong> A benchmark harness that
+    sweeps all lock/barrier/scheduler variants across thread counts
+    [1, 2, 4, 8, ..., 128] with multiple samples, outputting CSV. Three
+    application benchmarks: Monte Carlo Pi estimation, dense matrix multiply,
+    and Mandelbrot set rendering. A Python plotting script generates 19 graphs
+    from the CSV data. Hardware performance counter integration (via
+    <code>perf_event_open</code>) is implemented and will produce 5 additional
+    cache/MESI analysis graphs when run with the right permissions.
+</p>
+
+<h1>PRELIMINARY RESULTS</h1>
+<p class="indent">
+    All results below were collected on a 128-core machine. Each data point is
+    the median of 3 samples; barrier plots show mean +/- standard deviation.
+</p>
+
+<h1>ON THE DIFFICULTY OF BENCHMARKING</h1>
+<p class="indent">
+    Benchmarking synchronization primitives is harder than it looks. A few
+    things caught us off guard:
+</p>
+<p class="indent">
+    <strong>Measuring the right thing:</strong> Our first Pi benchmark showed
+    <em>negative</em> scaling. Turned out we were scaling total work with
+    thread count (each thread did <code>samples_per_thread</code> iterations,
+    so total work was <code>P * samples_per_thread</code>). We were measuring
+    how long increasing amounts of work took, not how fast a fixed amount of
+    work got parallelized. Looked totally reasonable until we thought about it.
+</p>
+<p class="indent">
+    <strong>Confounding variables:</strong> Lock throughput depends on NUMA
+    topology, cache line placement, OS scheduling, whether cores share an L2,
+    etc. At 128 threads, where the OS places your threads matters more than
+    which lock algorithm you picked. We don't pin threads to cores yet, so
+    all our measurements have cross-socket noise baked in.
+</p>
+<p class="indent">
+    <strong>Variance as signal:</strong> The barrier latency graph shows big
+    error bars for the sense barrier at 128 threads but tight ones for the tree
+    barrier. That's actually interesting on its own: the centralized barrier's
+    latency depends on which thread shows up last and how far away it is in
+    the cache hierarchy. We want to capture per-barrier latency histograms
+    within a single run eventually, not just variance across runs.
+</p>
+
+<p class="indent">
+    <strong>Lock throughput (zero critical section):</strong>
+</p>
+<img src="static/plots/lock_throughput_cs0.png" alt="Lock throughput at CS=0ns">
+<p class="indent">
+    At zero critical section length, TTAS and MCS lead at low thread counts
+    (~140M and ~110M ops/sec at 1 thread) since single-threaded acquire is
+    just an uncontended atomic. As threads increase, all spinlocks collapse:
+    TTAS drops from 140M to under 2M at 128 threads from cache line bouncing
+    across sockets. The weird part is that <strong>pthread_mutex dominates at
+    high contention</strong> (~12M ops/sec at 128 threads vs. ~2.7M for MCS,
+    the best spinlock). We want to figure out exactly why, since it's not
+    obvious why a kernel mutex should be this much faster.
+</p>
+
+<p class="indent">
+    <strong>Lock comparison at 64 threads:</strong>
+</p>
+<img src="static/plots/lock_comparison_bar.png" alt="Lock comparison bar chart">
+<p class="indent">
+    The bar chart makes it clearer: pthread gets 4x higher throughput
+    than MCS, and 14x higher than TAS at 64 threads. Not sure yet whether
+    it's futex behavior, reduced coherence traffic, or something else. We
+    plan to look at this with perf counters.
+</p>
+
+<p class="indent">
+    <strong>Barrier latency:</strong>
+</p>
+<img src="static/plots/barrier_latency.png" alt="Barrier latency vs threads">
+<p class="indent">
+    Both barriers scale roughly linearly from ~800ns at 2 threads to ~8-9us at
+    128 threads. Tree is a bit faster at 32-64 threads, probably less
+    contention on the arrive counter. The more interesting thing is the
+    <strong>error bars</strong>: sense has way higher variance at 128 threads
+    (+/-3us) while tree is much tighter (+/-500ns). When 128 threads compete on a
+    single <code>fetch_add</code>, the last thread's latency depends on where
+    it sits in the cache directory, which changes run-to-run.
+</p>
+
+<p class="indent">
+    <strong>Monte Carlo Pi, speedup:</strong>
+</p>
+<img src="static/plots/pi_speedup.png" alt="Pi speedup vs threads">
+<p class="indent">
+    Pi is embarrassingly parallel (no shared state during computation). Static
+    scheduling gets ~10x at 128 threads, while dynamic plateaus around ~7-8x.
+    Kind of unexpected for a workload with zero load imbalance: the
+    <code>fetch_add</code> in the dynamic scheduler's shared counter becomes
+    a bottleneck at 128 threads, even with chunk size 1024.
+</p>
+
+<p class="indent">
+    <strong>Matrix multiply, speedup:</strong>
+</p>
+<img src="static/plots/matmul_speedup.png" alt="Matmul speedup vs threads">
+<p class="indent">
+    Dense matrix multiply (256x256) has some weird non-monotonic behavior.
+    Both schedulers hit ~8-12x at 32 threads, but static dips at 64 before
+    recovering at 128. Probably a NUMA thing: at 64 threads the working set
+    splits across sockets in a bad way. A bigger matrix would probably scale
+    better.
+</p>
+
+<p class="indent">
+    <strong>Mandelbrot set, speedup:</strong>
+</p>
+<img src="static/plots/mandelbrot_speedup.png" alt="Mandelbrot speedup vs threads">
+<p class="indent">
+    This one really shows why dynamic scheduling matters. Pixels near the
+    set boundary need up to 500 iterations while exterior pixels bail out fast,
+    so the work per row varies a lot. Dynamic gets ~40x at 128
+    threads, while static tops out at ~5x -- an <strong>8x gap</strong>.
+</p>
+
+<h1>GOALS AND DELIVERABLES</h1>
+<p class="indent">
+    <strong>Status vs. proposal:</strong> We're roughly on schedule. The
+    proposal targeted basic scheduling and critical sections by the milestone.
+    We have all five lock variants, both barrier variants, both schedulers,
+    and a complete benchmark suite. Reductions are scaffolded but not fully
+    wired into the benchmark/test suite yet, so that's still on the board.
+</p>
+<p class="indent">
+    <strong>Updated plan to achieve (poster session):</strong>
+</p>
+<ul>
+    <li>Locks, barriers, schedulers, thread pool - <strong>done</strong></li>
+    <li>Reductions (linear + tree) - <strong>in progress</strong></li>
+    <li>Benchmark suite with automated plotting - <strong>done</strong></li>
+    <li>MESI cache analysis via hardware performance counters - <strong>in progress</strong> (code ready, awaiting perf_event access)</li>
+    <li>GOMP comparison on application benchmarks - remaining</li>
+    <li>Comprehensive analysis writeup - remaining</li>
+</ul>
+<p class="indent">
+    <strong>Hope to achieve:</strong>
+</p>
+<ul>
+    <li>Source-to-source compiler (<code>#pragma omp</code> to omp0 API calls)</li>
+    <li>N-body simulation benchmark</li>
+    <li>Oversubscription analysis with yielding spinlocks</li>
+    <li>PSC scaling tests at even higher core counts</li>
+</ul>
+<p class="indent">
+    We're confident we'll hit all the plan-to-achieve deliverables. The
+    source-to-source compiler is the main stretch goal and depends on how
+    fast we finish the GOMP comparison and analysis.
+</p>
+
+<h1>POSTER SESSION PLAN</h1>
+<p class="indent">
+    We plan to show:
+</p>
+<ul>
+    <li><strong>Graphs:</strong> Lock throughput/fairness curves, MESI stacked
+        bar charts (L1d read vs. write misses per lock variant), barrier latency
+        scaling, application speedup curves (pi, matmul, mandelbrot), and omp0
+        vs. GOMP comparison</li>
+    <li><strong>Live demo:</strong> Running the benchmark suite on a GHC machine
+        and generating all plots in real-time, showing how different
+        <code>RuntimeConfig</code> choices affect performance</li>
+</ul>
+
+<h1>UPDATED SCHEDULE</h1>
+<table>
+    <tr>
+        <th>When</th>
+        <th>Task</th>
+        <th>Who</th>
+    </tr>
+    <tr>
+        <td>Week 1 (Mar 31)</td>
+        <td>Thread pool, parallel regions, lock interfaces</td>
+        <td>Both - <strong>done</strong></td>
+    </tr>
+    <tr>
+        <td>Week 2 (Apr 7)</td>
+        <td>All 5 locks, 2 barriers, 2 schedulers, runtime API</td>
+        <td>Both - <strong>done</strong></td>
+    </tr>
+    <tr>
+        <td>Week 3 (Apr 14)</td>
+        <td>Benchmark harness, all plots, perf counter integration</td>
+        <td>Both - <strong>done</strong></td>
+    </tr>
+    <tr>
+        <td>Apr 14-17</td>
+        <td>Finish reductions, run benchmarks on GHC, collect MESI/cache data</td>
+        <td>Both</td>
+    </tr>
+    <tr>
+        <td>Apr 17-20</td>
+        <td>GOMP comparison: compile apps with <code>-fopenmp</code>, benchmark</td>
+        <td>Sreeram</td>
+    </tr>
+    <tr>
+        <td>Apr 20-23</td>
+        <td>Source-to-source compiler (stretch goal)</td>
+        <td>Bhargav</td>
+    </tr>
+    <tr>
+        <td>Apr 23-25</td>
+        <td>Analysis writeup, poster preparation</td>
+        <td>Both</td>
+    </tr>
+    <tr>
+        <td>Apr 25-28</td>
+        <td>Final report, polish, contingency buffer</td>
+        <td>Both</td>
+    </tr>
+</table>
+
+<h1>CONCERNS</h1>
+<p class="indent">
+    <strong>Spinlock livelock under oversubscription:</strong> When thread count
+    exceeds physical cores, our pure spinlocks (TAS, TTAS, ticket) livelock.
+    There might be a bug, but it requires further testing. We cap
+    benchmarks at <code>hardware_concurrency()</code> and provide an
+    <code>OMP0_MAX_THREADS</code> environment variable override. For the
+    oversubscription analysis, we plan to add <code>sched_yield()</code>
+    backoff to the spin loops.
+</p>
+
+<h1>SEE ALSO</h1>
+<p class="indent">
+    <a href="index.html">Back to project page</a>
+</p>
+
+<div class="man-footer">
+    <span>CMU 15-418</span>
+    <span>Spring 2026</span>
+    <span>OMP0(418)</span>
+</div>
+
+</body>
+</html>

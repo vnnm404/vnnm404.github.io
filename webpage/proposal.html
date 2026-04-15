@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OMP0(418) - Proposal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<div class="man-header">
+    <span>OMP0(418)</span>
+    <span class="man-title">Proposal</span>
+    <span>OMP0(418)</span>
+</div>
+
+<h1>TITLE</h1>
+<p class="indent">
+    <strong>omp0</strong> — a minimal OpenMP implementation
+</p>
+
+<h1>AUTHORS</h1>
+<p class="indent">
+    <a href="mailto:svennam@andrew.cmu.edu">Sreeram</a>,
+    <a href="mailto:bkomire@andrew.cmu.edu">Bhargav</a>
+</p>
+
+<h1>SUMMARY</h1>
+<p class="indent">
+    We're going to implement omp0, a subset of the OpenMP runtime library and
+    a source-to-source compiler that transforms OpenMP pragmas into calls to our
+    runtime. We'll target multi-core CPUs using pthreads as the threading backend,
+    and evaluate performance against the reference GNU OpenMP (GOMP) implementation
+    on standard parallel benchmarks.
+</p>
+<p class="indent">
+    A key focus will be exploring different synchronization primitive implementations
+    and their cache coherence effects: ticket locks vs. test-and-set vs. MCS locks,
+    centralized vs. tree barriers, and per-thread vs. tree reductions. We'll
+    measure how these choices impact performance at different thread counts and
+    contention levels using hardware performance counters.
+</p>
+
+<h1>BACKGROUND</h1>
+
+<p class="indent">
+    <strong>Parallel Regions (Fork-Join)</strong>
+</p>
+<p class="indent">
+    OpenMP follows the fork-join model. When a thread encounters a parallel region,
+    it forks a team of worker threads that execute the region concurrently, then
+    joins back to sequential execution:
+</p>
+<pre>
+#pragma omp parallel
+{
+    // Each thread executes this block
+    int tid = omp_get_thread_num();
+    do_work(tid);
+}
+// Implicit barrier and join here
+</pre>
+<p class="indent">
+    The runtime maintains a persistent thread pool to amortize pthread_create
+    overhead. Threads sleep when idle and wake on region entry.
+</p>
+
+<p class="indent">
+    <strong>Work Scheduling: Static, Dynamic, Guided</strong>
+</p>
+<p class="indent">
+    Static scheduling partitions iterations at region entry. Thread i gets
+    iterations [i*N/P, (i+1)*N/P). Zero runtime overhead, but poor load balance
+    if iteration costs vary.
+</p>
+<p class="indent">
+    Dynamic scheduling uses a shared counter. Threads atomically claim chunks:
+</p>
+<pre>
+while ((start = atomic_fetch_add(&next, chunk)) < N)
+    for (i = start; i < min(start + chunk, N); i++)
+        process(i);
+</pre>
+<p class="indent">
+    Small chunks improve load balance but increase contention on the counter.
+    Guided scheduling starts with large chunks and shrinks them, balancing both.
+</p>
+
+<p class="indent">
+    <strong>Barriers</strong>
+</p>
+<p class="indent">
+    A centralized counter barrier has all threads increment a shared counter
+    and spin until it reaches P:
+</p>
+<pre>
+atomic_inc(&arrive_count);
+while (arrive_count < num_threads);
+</pre>
+<p class="indent">
+    This causes O(P) invalidations as each increment bounces the cache line.
+    A sense-reversing barrier alternates a flag to avoid resetting the counter.
+    A tree barrier organizes threads hierarchically: threads first synchronize
+    within groups, then group leaders synchronize, reducing contention to O(log P).
+</p>
+
+<p class="indent">
+    <strong>Critical Sections and Mutex Implementations</strong>
+</p>
+<p class="indent">
+    Test-and-set (TAS) acquires by spinning on an atomic swap:
+</p>
+<pre>
+while (atomic_swap(&lock, 1) == 1);  // spin until we get 0
+</pre>
+<p class="indent">
+    Every spin iteration issues a write, causing cache invalidations across all
+    cores even when the lock is held. Test-and-test-and-set (TTAS) improves this
+    by spinning on a read first:
+</p>
+<pre>
+while (1) {
+    while (lock);                    // spin on cached read (no bus traffic)
+    if (atomic_swap(&lock, 1) == 0)  // try to acquire
+        break;
+}
+</pre>
+<p class="indent">
+    Ticket locks provide FIFO fairness. Each thread takes a ticket number and
+    waits for its turn:
+</p>
+<pre>
+int my_ticket = atomic_fetch_add(&next_ticket, 1);
+while (now_serving != my_ticket);
+</pre>
+<p class="indent">
+    When the lock is released (now_serving++), all waiters' cache lines are
+    invalidated even though only one can proceed. MCS locks solve this with
+    a linked list where each thread spins on its own node.
+</p>
+
+<p class="indent">
+    <strong>Atomic Operations</strong>
+</p>
+<p class="indent">
+    The atomic directive maps directly to hardware atomics for simple updates:
+</p>
+<pre>
+#pragma omp atomic
+counter++;   // becomes: atomic_fetch_add(&counter, 1)
+</pre>
+<p class="indent">
+    This avoids mutex overhead for single-word updates but still causes cache
+    line bouncing under contention.
+</p>
+
+<p class="indent">
+    <strong>Reductions</strong>
+</p>
+<p class="indent">
+    A critical-section reduction serializes all updates:
+</p>
+<pre>
+#pragma omp critical
+global_sum += local_sum;  // O(P) serial time
+</pre>
+<p class="indent">
+    Per-thread reduction gives each thread a private accumulator, combined at
+    the barrier:
+</p>
+<pre>
+partial[tid] = local_sum;
+barrier();
+if (tid == 0)
+    for (i = 0; i < P; i++) global_sum += partial[i];
+</pre>
+<p class="indent">
+    This is O(P) but only the master does the work. A tree reduction parallelizes
+    the combine phase in O(log P) steps, which matters at high thread counts.
+</p>
+
+<h1>THE CHALLENGE</h1>
+<p class="indent">
+    The main challenge here is navigating the tradeoffs between correctness, performance,
+    and cache coherence. Each synchronization primitive has multiple implementations
+    with different characteristics under varying contention levels.
+</p>
+<p class="indent">
+    For mutexes, TAS is simple but generates excessive bus traffic. TTAS reduces
+    traffic but causes thundering herd on release. Ticket locks are fair but
+    suffer the same invalidation storm. MCS locks are optimal but complex. We
+    want to measure which of these actually matters for typical OpenMP workloads.
+</p>
+<p class="indent">
+    For barriers, centralized barriers are simple but O(P) in coherence traffic.
+    Tree barriers reduce traffic but add latency from multiple synchronization
+    phases. The right choice depends on thread count and how often barriers occur.
+</p>
+<p class="indent">
+    For reductions, the combining strategy matters at scale. Per-thread arrays
+    with linear combining is simple but serializes the final phase. Tree reductions
+    parallelize combining but require log(P) barrier-like synchronizations.
+</p>
+<p class="indent">
+    We'll use hardware performance counters (cache misses, bus transactions)
+    to understand the cache coherence impact of each implementation choice.
+</p>
+
+<h1>RESOURCES</h1>
+<p class="indent">
+    <strong>Hardware:</strong> GHC cluster machines, PSC bridges2 for scaling tests
+</p>
+<p class="indent">
+    <strong>Software:</strong> Starting from scratch using pthreads. Will use Clang's lexer
+    for pragma parsing or a simple custom parser.
+</p>
+
+<h1>GOALS AND DELIVERABLES</h1>
+<p class="indent">
+    <strong>Plan to achieve:</strong>
+</p>
+<ul>
+    <li><code>#pragma omp parallel</code> — thread team creation with persistent pool</li>
+    <li><code>#pragma omp for</code> — static and dynamic scheduling</li>
+    <li><code>reduction</code> clause — thread-local accumulators with tree reduce</li>
+    <li><code>#pragma omp barrier</code> — sense-reversing barrier</li>
+    <li><code>#pragma omp critical</code> — mutex-protected regions</li>
+    <li>Source-to-source compiler for the above pragmas</li>
+</ul>
+<p class="indent">
+    <strong>Hope to achieve:</strong>
+</p>
+<ul>
+    <li><code>private</code>/<code>shared</code> clauses</li>
+    <li><code>#pragma omp atomic</code> — map to hardware atomics</li>
+    <li><code>firstprivate</code>/<code>lastprivate</code> clauses</li>
+    <li><code>guided</code> scheduling</li>
+    <li>Nested parallelism</li>
+    <li>Source to source compiler</li>
+</ul>
+<p class="indent">
+    <strong>Benchmarks:</strong> We'll evaluate omp0 against GOMP on:
+</p>
+<ul>
+    <li>Pi calculation (Monte Carlo) — tests reduction, random number generation</li>
+    <li>Mandelbrot set — irregular workload, tests dynamic scheduling</li>
+    <li>N-body simulation — tests barriers, reductions, compute-heavy loops</li>
+    <li>Matrix multiplication — regular workload, tests static scheduling, cache behavior</li>
+</ul>
+
+<h1>PLATFORM CHOICE</h1>
+<p class="indent">
+    We chose multi-core x86 CPUs with pthreads because:
+</p>
+<ul>
+    <li>OpenMP is designed for shared-memory systems</li>
+    <li>pthreads gives us direct control over thread creation and synchronization</li>
+    <li>GHC machines provide a consistent test environment</li>
+    <li>PSC bridges2 allows us to scale up to high thread counts for testing</li>
+    <li>Easy to compare against GOMP (same backend)</li>
+</ul>
+
+<h1>SCHEDULE</h1>
+<ul>
+    <li><strong>Week 1:</strong> Thread pool implementation, basic <code>parallel</code> region</li>
+    <li><strong>Week 2:</strong> Static scheduling for <code>parallel for</code>, barriers</li>
+    <li><strong>Week 3:</strong> Dynamic scheduling, critical sections — <em>MILESTONE</em></li>
+    <li><strong>Week 4:</strong> Reductions, private/shared clauses</li>
+    <li><strong>Week 5:</strong> Performance tuning, benchmarking</li>
+</ul>
+
+<h1>SEE ALSO</h1>
+<p class="indent">
+    <a href="index.html">← Back to project page</a>
+</p>
+
+<div class="man-footer">
+    <span>CMU 15-418</span>
+    <span>Spring 2026</span>
+    <span>OMP0(418)</span>
+</div>
+
+</body>
+</html>
