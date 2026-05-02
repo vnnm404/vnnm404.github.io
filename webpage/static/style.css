@@ -132,9 +132,84 @@ code {
 }
 
 img {
-    max-width: 100%;
+    /* Singleton images are scaled down so they don't visually
+       dominate the prose. Group images via .plot-grid-* below
+       intentionally break out wider than this. */
+    max-width: min(640px, 100%);
     margin: 15px 0 15px 7ch;
     display: block;
+}
+
+/* Group of plots that breaks out of the 1000px text column to be
+   wider than the surrounding prose. Used for related plots
+   (e.g. throughput at four CS values) where seeing them at once
+   is more useful than scrolling past them individually. */
+.plot-grid-2x2,
+.plot-grid-2col,
+.plot-grid-3col {
+    display: grid;
+    gap: 6px 10px;
+    margin: 20px auto;
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.plot-grid-2x2 {
+    grid-template-columns: 1fr 1fr;
+    width: min(1280px, calc(100vw - 40px));
+}
+
+.plot-grid-2col {
+    grid-template-columns: 1fr 1fr;
+    width: min(1100px, calc(100vw - 40px));
+}
+
+.plot-grid-3col {
+    grid-template-columns: 1fr 1fr 1fr;
+    width: min(1380px, calc(100vw - 40px));
+}
+
+.plot-grid-2x2 img,
+.plot-grid-2col img,
+.plot-grid-3col img {
+    margin: 0;
+    width: 100%;
+    max-width: 100%;
+    display: block;
+}
+
+/* Standalone wide image — for already-multi-panel figures that need
+   to break out of the 640px singleton cap. Same break-out width as
+   .plot-grid-2x2. */
+img.plot-wide {
+    max-width: min(1280px, calc(100vw - 40px));
+    width: min(1280px, calc(100vw - 40px));
+    margin: 20px auto;
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+@media (max-width: 800px) {
+    .plot-grid-2x2,
+    .plot-grid-2col,
+    .plot-grid-3col {
+        grid-template-columns: 1fr;
+        width: 100%;
+        margin: 20px 0 20px 7ch;
+        position: static;
+        transform: none;
+        left: auto;
+    }
+    img.plot-wide {
+        width: 100%;
+        max-width: 100%;
+        margin: 20px 0 20px 7ch;
+        position: static;
+        transform: none;
+        left: auto;
+    }
 }
 
 table {

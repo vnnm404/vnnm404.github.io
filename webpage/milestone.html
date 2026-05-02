@@ -216,19 +216,20 @@ int main() {
     <strong>Status vs. proposal:</strong> We're roughly on schedule. The
     proposal targeted basic scheduling and critical sections by the milestone.
     We have all five lock variants, both barrier variants, both schedulers,
-    and a complete benchmark suite. Reductions are scaffolded but not fully
-    wired into the benchmark/test suite yet, so that's still on the board.
+    and a complete benchmark suite. Reductions, the GOMP comparison, and the
+    final report are tracked on the <a href="final.html">final report
+    page</a>.
 </p>
 <p class="indent">
     <strong>Updated plan to achieve (poster session):</strong>
 </p>
 <ul>
     <li>Locks, barriers, schedulers, thread pool - <strong>done</strong></li>
-    <li>Reductions (linear + tree) - <strong>in progress</strong></li>
+    <li>Reductions (linear + tree) wired through the runtime - <strong>done</strong></li>
     <li>Benchmark suite with automated plotting - <strong>done</strong></li>
-    <li>MESI cache analysis via hardware performance counters - <strong>in progress</strong> (code ready, awaiting perf_event access)</li>
-    <li>GOMP comparison on application benchmarks - remaining</li>
-    <li>Comprehensive analysis writeup - remaining</li>
+    <li>MESI cache analysis via hardware performance counters - <strong>done</strong> (PerfCounters made tolerant of WSL2's missing events; the final report has the plots)</li>
+    <li>GOMP comparison on application benchmarks - <strong>done</strong></li>
+    <li>Comprehensive analysis writeup - in progress on the final report page</li>
 </ul>
 <p class="indent">
     <strong>Hope to achieve:</strong>

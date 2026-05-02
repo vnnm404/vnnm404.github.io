@@ -19,20 +19,887 @@
 
 <h1>TITLE</h1>
 <p class="indent">
-    <strong>omp0</strong> — a minimal OpenMP implementation
+    <strong>omp0</strong> - a minimal OpenMP runtime, implemented from
+    scratch on pthreads, evaluated against GCC's libgomp.
 </p>
 
 <h1>AUTHORS</h1>
 <p class="indent">
-    <a href="mailto:svennam@andrew.cmu.edu">Sreeram</a>,
-    <a href="mailto:bkomire@andrew.cmu.edu">Bhargav</a>
+    <a href="mailto:svennam@andrew.cmu.edu">Sreeram (svennam)</a>,
+    <a href="mailto:bkommire@andrew.cmu.edu">Bhargav (bkommire)</a>
 </p>
 
-<p class="todo">— TODO —</p>
+<h1>SUMMARY</h1>
+<p class="indent">
+    <strong>omp0</strong> is a from-scratch OpenMP runtime:
+    <code>parallel</code>, <code>parallel for</code> (static / dynamic
+    / guided), <code>critical</code> (5 spinlocks + pthread_mutex + a
+    custom futex lock), 2 barriers (sense, tree), and 2 reductions
+    (linear, tree). Every primitive is behind an interface, swapped
+    via one <code>RuntimeConfig</code> field. Benchmarks: Pi, 256x256
+    matmul, 512x512 Mandelbrot. Platforms: GHC Coffee Lake (8 cores)
+    and PSC Bridges-2 EPYC 7742 (128 cores). Compared to libgomp.
+    Instrumented with hardware perf counters. 63 unit tests pass.
+    Headline result: the best lock depends on platform; the
+    "spinlocks beat mutexes for short critical sections" rule
+    inverts between GHC and PSC.
+</p>
+
+<h1>BACKGROUND</h1>
+<p class="indent">
+    OpenMP is fork-join shared-memory.
+    <code>#pragma omp parallel</code> forks a team that runs the
+    region concurrently, joins at the end. A persistent thread
+    pool avoids paying <code>pthread_create</code> on every
+    region. Inside a region, three classes of primitives:
+</p>
+<p class="indent">
+    <strong>Loops.</strong> Static schedules pre-compute
+    <code>[i&middot;N/P, (i+1)&middot;N/P)</code> per thread ;
+    no runtime cost, bad if iterations vary. Dynamic uses a shared
+    <code>fetch_add</code> counter to claim chunks. Guided is dynamic
+    with shrinking chunks.
+</p>
+<p class="indent">
+    <strong>Locks.</strong> TAS spins via atomic exchange: every spin
+    is a write, so contention causes an invalidation storm. TTAS
+    spins on a cached read, only writes to acquire. Ticket adds FIFO:
+    <code>fetch_add(&amp;next_ticket)</code>, wait for
+    <code>now_serving</code> to match. MCS uses a per-thread queue
+    node: spin on your own line, release writes only the successor's.
+</p>
+<p class="indent">
+    <strong>Barriers.</strong> Sense-reversing: shared counter +
+    sense flag, last arriver flips the flag. Tree: binary tree of
+    arrivals, <em>O</em>(log P) depth.
+</p>
+<p class="indent">
+    <strong>Reductions.</strong> Linear: each thread writes a
+    partial, master combines in <em>P</em> sequential ops. Tree:
+    &lceil;log<sub>2</sub>&nbsp;P&rceil; phases of pairwise
+    combines with a barrier between each.
+</p>
+<p class="indent">
+    <strong>What's parallelized.</strong> A
+    <code>#pragma omp parallel</code> region is the unit of work.
+    Entering it wakes the pool; all <em>P</em> threads run the body
+    concurrently with different <code>tid</code>s; exiting puts
+    workers back to sleep. <code>parallel_for</code> additionally
+    splits loop iterations via the scheduler. Everything outside the
+    region runs only on master. Our app kernels:
+    Pi (independent per-thread RNG), matmul (one row per thread),
+    Mandelbrot (per-pixel iteration with very uneven termination).
+    Runtime's job is cheap region entry/exit, cheap work assignment,
+    and cheap sync.
+</p>
+<p class="indent">
+    <strong>Locality and SIMD.</strong> Apps have natural locality
+    (contiguous output slices). No SIMD beyond what the compiler
+    infers; vectorization is orthogonal. The sync primitives have
+    rich locality behavior (which line bounces, which stays
+    in S, which thread spins where). That's our HW-counter
+    focus.
+</p>
+
+<h1>APPROACH</h1>
+<p class="indent">
+    <strong>Stack.</strong> C++20 + pthreads, ~2500 lines, CMake.
+    Targets: GHC Coffee Lake (8c/16t) and PSC Bridges-2 EPYC 7742
+    (128 cores, dual socket).
+</p>
+<p class="indent">
+    <strong>Architecture.</strong> Abstract interfaces
+    (<code>Lock</code>, <code>Barrier</code>, <code>Scheduler</code>)
+    + a single <code>RuntimeConfig</code> for selection:
+</p>
+<pre>
+omp0::RuntimeConfig cfg;
+cfg.num_threads = 4;
+cfg.lock        = omp0::LockKind::MCS;
+cfg.barrier     = omp0::BarrierKind::Tree;
+cfg.sched       = omp0::SchedKind::Dynamic;
+cfg.reduce      = omp0::ReduceKind::Tree;
+cfg.pin_threads = true;
+omp0::Runtime rt(cfg);
+
+int sum = rt.reduce&lt;int&gt;(0,
+    [&amp;](int tid, int){ return work(tid); },
+    [](int a, int b){ return a + b; });
+</pre>
+<p class="indent">
+    The <code>Runtime</code> owns a persistent <code>ThreadPool</code>.
+    <code>parallel()</code> dispatches: master is <code>tid&nbsp;0</code>,
+    workers are <code>tid&nbsp;1..N-1</code>.
+    <code>parallel_for</code> builds a scheduler and each thread
+    calls <code>next()</code>. <code>critical</code> wraps a call
+    with the configured lock. <code>reduce</code> joins partials
+    via linear or tree.
+</p>
+<p class="indent">
+    <strong>Mapping to hardware.</strong> Workers are pthreads.
+    <code>pin_threads = true</code> binds worker <code>i</code> to
+    core <code>i mod nproc</code>. Lock/barrier state is
+    <code>alignas(64)</code> to avoid false sharing. MCS's queue
+    node is <code>thread_local</code>: spinning happens on memory
+    only the owner reads, only the predecessor writes. Each thread
+    opens its own <code>perf_event_open</code> fd; harnesses sum
+    counters after join.
+</p>
+<p class="indent">
+    <strong>Bench infrastructure.</strong> Six independent CMake
+    targets, one CSV each:
+</p>
+<table>
+    <tr><th>target</th><th>what it measures</th></tr>
+    <tr><td><code>omp0_bench</code></td><td>apps (pi, matmul, mandelbrot) &times; 3 schedulers &times; {pinned, unpinned} &times; threads 1..hw</td></tr>
+    <tr><td><code>gomp_bench</code></td><td>same apps, libgomp reference (compiled with <code>-fopenmp</code>)</td></tr>
+    <tr><td><code>lock_bench</code></td><td>6 lock variants &times; 4 critical-section lengths {0, 100ns, 1us, 10us} &times; threads 1..hw, with HW counters</td></tr>
+    <tr><td><code>barrier_bench</code></td><td>2 barrier variants &times; threads 1..hw, with HW counters</td></tr>
+    <tr><td><code>reduction_bench</code></td><td>linear vs tree combine &times; threads 1..hw, with HW counters</td></tr>
+    <tr><td><code>oversub_bench</code></td><td>locks at thread counts past hw_concurrency (1, 2, 4, 8, 16, 32, 128)</td></tr>
+</table>
+<p class="indent">
+    <code>plot.py</code> dispatches on which <code>benchmark</code>
+    rows are present. <code>scripts/run_all.sh</code> orchestrates,
+    with skip flags (<code>SKIP_OVERSUB</code>, <code>SKIP_GOMP</code>,
+    <code>OMP0_MAX_THREADS</code>, etc.) for partial sweeps.
+</p>
+
+<h1>HOW WE GOT HERE</h1>
+<p class="indent">
+    Three bugs worth recording.
+</p>
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Reduction synchronization, four attempts</h2>
+<p class="indent">
+    Tree reduction needs a barrier between strides. We tried, in
+    order:
+</p>
+<ol class="indent" style="margin-left: 7ch;">
+    <li><strong>Our own <code>SenseBarrier</code>.</strong> Uses
+        <code>static thread_local int local_sense_</code>. Works
+        for one barrier instance, breaks across multiple
+        <code>Runtime</code> instances on the same thread:
+        <code>local_sense_</code> persists, fresh workers see the
+        initial value, protocol desyncs.</li>
+    <li><strong><code>std::barrier</code>.</strong> Fixed the
+        desync but deadlocks on libstdc++ under heavy reuse.</li>
+    <li><strong>Custom phase-counter barrier.</strong> Also
+        deadlocked.</li>
+    <li><strong>Per-stride <code>pthread_barrier_t</code>.</strong>
+        Final answer. Constructed fresh per reduction call. No
+        thread-local state, no reuse races.</li>
+</ol>
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Measuring perf counters on Intel vs AMD</h2>
+
+<p class="indent">
+    <code>perf_event_open</code> looks unified across vendors but
+    leaks in three places: counter count, scheduling rules, and
+    event-name mappings.
+</p>
+
+<p class="indent">
+    <strong>(1) Counter count.</strong> Coffee Lake: 8 GP PMCs +
+    3 fixed (cycles, instructions, ref_cycles). Zen 2: 6 GP, no
+    fixed. Our first wrapper opened 8 events (cycles, instructions,
+    L1d read/write miss, LLC miss, cache refs, bus cycles, branch
+    miss) as one perf group with <code>PERF_FORMAT_GROUP</code> for
+    atomic reads. Works on Intel. On AMD, 8 grouped events don't
+    fit in 6 PMCs, and grouped events can't multiplex, so the
+    kernel never schedules the group. Each
+    <code>perf_event_open</code> succeeds,
+    <code>available()</code> returns <code>true</code>, every read
+    returns 0. First AMD run: a CSV of zeros that looked like
+    missing data, not a bug.
+</p>
+
+<p class="indent">
+    <strong>(2) Multiplexing + time scaling.</strong> Drop
+    <code>PERF_FORMAT_GROUP</code>; open each event independently
+    with
+    <code>PERF_FORMAT_TOTAL_TIME_ENABLED&nbsp;|&nbsp;TIME_RUNNING</code>.
+    Kernel multiplexes events across PMCs. Each read returns
+    <code>{value, time_enabled, time_running}</code>. Scale by
+    <code>time_enabled / time_running</code>:
+</p>
+<pre class="indent" style="margin-left: 7ch; background: #f4f4ee; border: 1px solid #d6d6c8; padding: 8px 12px; overflow-x: auto;"><code>struct { uint64_t value, time_enabled, time_running; } data{};
+read(fds_[i], &amp;data, sizeof(data));
+
+uint64_t scaled = data.value;
+if (data.time_running &gt; 0 &amp;&amp; data.time_running &lt; data.time_enabled) {
+    double r = (double)data.time_enabled / (double)data.time_running;
+    scaled = (uint64_t)((double)data.value * r);
+}</code></pre>
+<p class="indent">
+    Tradeoff: lose cross-event atomicity. Fine for benches that
+    integrate over hundreds of ms.
+</p>
+
+<p class="indent">
+    <strong>(3) Bad event mappings.</strong> Two abstracted events
+    don't map cleanly:
+</p>
+<ul class="indent" style="margin-left: 7ch;">
+    <li><code>PERF_COUNT_HW_BUS_CYCLES</code>: designed for
+        the Pentium FSB. Modern Intel/AMD use point-to-point
+        interconnects (UPI, Infinity Fabric). Returns garbage.
+        Dropped from plots.</li>
+    <li><code>PERF_COUNT_HW_CACHE_L1D&nbsp;|&nbsp;OP_WRITE&nbsp;|&nbsp;RESULT_MISS</code>:
+        no clean native mapping on either CPU. Closest:
+        Intel <code>L2_RQSTS.RFO_HIT/MISS</code>, AMD
+        <code>L1_DC_REFILLS</code> (different semantics).
+        Kernel returns 0. The L1d-misses-stacked plot is read-only
+        as a result.</li>
+</ul>
+
+<p class="indent">
+    <strong>(4) Graceful degradation.</strong> Each event opens
+    independently; a failed <code>perf_event_open</code> just
+    skips that event. PSC needs <code>sbatch -C PERF</code> for
+    PMU access; without it every read is &minus;EACCES. Without
+    graceful degradation, the whole sweep would die on the wrong
+    partition. Wrapper lives at <code>src/perf/counters.cpp</code>.
+</p>
+
+<p class="indent">
+    Same binary, same C++, but counter count, scheduling, and
+    event semantics all differ; a naive
+    <code>perf_event_open</code> works on one CPU and silently
+    lies on the other.
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">ThreadPool race on AMD</h2>
+<p class="indent">
+    Original design: shared <code>active_</code> counter, master
+    sets it to <code>N-1</code>, workers <code>fetch_sub</code>,
+    last worker notifies <code>cv_done_</code>. Worked on Coffee
+    Lake for millions of rounds. Deadlocked on EPYC 7742 around
+    round 80&ndash;100 of the reduction bench.
+</p>
+<p class="indent">
+    Bug: a slow worker's <code>fetch_sub</code> for round <i>K</i>
+    could land <em>after</em> master had already started round
+    <i>K+1</i> and reset <code>active_</code> to <i>N&minus;1</i>.
+    The late decrement now lands in round <i>K+1</i>'s counter
+   ; off-by-one forever. Intel's TSO hides this because the
+    worker's gap between <code>fetch_sub</code> and re-entering
+    <code>cv_work_.wait</code> is microscopic. Zen 2's cross-CCX
+    latency stretches it enough to fire ~1% of transitions;
+    cumulative deadlock probability hits 50% around round 70.
+</p>
+<p class="indent">
+    Fix: per-generation completion slots
+    <code>worker_finished_count_[gen&nbsp;&amp;&nbsp;1]</code>.
+    Each worker increments its own round's slot. Master spins
+    (with <code>this_thread::yield</code>) on the slot for the
+    round it kicked off. <code>my_gen</code> is captured under
+    the lock and monotonic per worker, so completions can't
+    cross rounds.
+</p>
+
+<h1>RESULTS</h1>
+<p class="indent">
+    Three sections: <strong>GHC</strong> (Coffee Lake, 8 cores) for
+    small-scale per-primitive analysis;
+    <strong>PSC</strong> (EPYC 7742, 128 cores, dual socket)
+    for high-thread-count behavior;
+    <strong>cross-machine</strong> for the results that need both.
+    Data points are median or mean &plusmn; &sigma; of 3&ndash;5
+    samples; warmup runs discarded. HW counters per-thread, summed
+    after join. Both platforms run the same binaries
+    (<code>-O3 -march=native</code>).
+</p>
+
+<h1>GHC RESULTS (COFFEE LAKE, 8 CORES)</h1>
+<p class="indent">
+    Intel Coffee Lake-S, 8c/16t, single socket, single L3.
+    HW counters fully available. Development platform.
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Locks</h2>
+
+<p class="indent">
+    <strong>Throughput vs threads, by CS length.</strong>
+    Four CS values: 0, 100&nbsp;ns, 1&nbsp;&micro;s, 10&nbsp;&micro;s.
+    Y-axis is log when the spread &gt;5&times;.
+</p>
+<div class="plot-grid-2x2" id="ghc-lock-throughput">
+    <img src="static/ghc/plots/lock_throughput_cs0.png" alt="Lock throughput, cs=0">
+    <img src="static/ghc/plots/lock_throughput_cs100.png" alt="Lock throughput, cs=100ns">
+    <img src="static/ghc/plots/lock_throughput_cs1000.png" alt="Lock throughput, cs=1us">
+    <img src="static/ghc/plots/lock_throughput_cs10000.png" alt="Lock throughput, cs=10us">
+</div>
+<p class="indent">
+    Three regimes:
+</p>
+<ul class="indent" style="margin-left: 7ch;">
+    <li><strong>Uncontended (1 thread):</strong> spinlocks ~125&nbsp;M
+        ops/sec (one inlined atomic, ~8&nbsp;ns); pthread ~19&nbsp;ns
+        (libgcc indirection + bookkeeping).</li>
+    <li><strong>Contended, cs=0:</strong> spinlocks lose to cache-line
+        bouncing. TAS collapses fastest (every spin is a write).
+        pthread holds steady (sleeps instead of spinning).</li>
+    <li><strong>cs=10&micro;s:</strong> spinlocks at theoretical max
+        ~98&nbsp;K ops/sec; pthread is <em>worst</em> at ~63&nbsp;K.
+        Each contended acquire pays a ~500&nbsp;ns futex roundtrip
+        the held-time can't absorb.</li>
+</ul>
+
+<p class="indent">
+    <strong>MESI / cache traffic, all at cs=0.</strong> Top-left:
+    total L1d misses. Top-right: L1d miss rate per cycle. Bottom:
+    LLC misses and rate.
+</p>
+<div class="plot-grid-2x2" id="ghc-lock-cache">
+    <img src="static/ghc/plots/lock_cache_misses_vs_threads.png" alt="L1d misses vs threads, by lock variant">
+    <img src="static/ghc/plots/lock_miss_rate.png" alt="L1d miss rate per cycle">
+    <img src="static/ghc/plots/lock_llc_misses_vs_threads.png" alt="LLC misses vs threads, by lock variant">
+    <img src="static/ghc/plots/lock_llc_miss_rate.png" alt="LLC miss rate per cycle">
+</div>
+<p class="indent">
+    At 16 threads: TAS / ticket ~5.5&nbsp;M L1d misses, MCS
+    ~4&nbsp;M, TTAS ~2.9&nbsp;M, pthread ~1&nbsp;M (sleeps, never
+    touches userspace memory). Per-cycle rate flips it: ticket / MCS
+    are lowest (private L1-resident spin); pthread is highest (few
+    active cycles, all near cache-cold futex transitions). LLC: TAS
+    / ticket scale with threads (line-bouncing); MCS and TTAS stay
+    flat (private lines); pthread near zero.
+</p>
+
+<p class="indent">
+    <strong>Cycle accounting + IPC.</strong>
+</p>
+<div class="plot-grid-2col" id="ghc-lock-cycles">
+    <img src="static/ghc/plots/lock_cycles_per_acquire.png" alt="Cycles per acquire">
+    <img src="static/ghc/plots/lock_ipc.png" alt="Lock IPC vs threads">
+</div>
+<p class="indent">
+    Pthread: flat ~250 cycles (sleeps, doesn't burn cycles
+    spinning). TAS rises fastest (every spin = stalled
+    <code>LOCK XCHG</code>). Ticket / MCS rise sharply near
+    hw_concurrency; FIFO + preemption stalls the whole queue
+    behind a descheduled holder. IPC at 16 threads: TAS ~0.01
+    (spin-stalled); MCS / ticket 3+ (L1-resident spin, dense but
+    useless). <em>High IPC &ne; making progress.</em>
+</p>
+
+<img src="static/ghc/plots/lock_cache_misses_stacked.png" alt="L1d read misses per lock variant">
+<p class="indent">
+    L1d read misses at 16 threads. (Wanted read+write breakdown but
+    <code>PERF_COUNT_HW_CACHE_L1D|OP_WRITE|RESULT_MISS</code>
+    returns 0 on both CPUs; see the perf-counters section.)
+    Ticket dominates: every waiter re-reads <code>now_serving</code>
+    after each release. TAS is close behind: every spin is an RMW.
+    MCS is quiet: waiters read their own private node, only
+    invalidated by the predecessor's release write. pthread is
+    quietest: blocked threads aren't running.
+</p>
+
+<p class="indent">
+    <strong>Oversubscription</strong> (threads &gt; nproc): FIFO
+    locks pay for fairness.
+</p>
+<img src="static/ghc/plots/oversub_throughput.png" alt="Lock throughput across oversubscription">
+<p class="indent">
+    Sweep nproc/2 to 16&times; nproc, cs=0. <strong>MCS and ticket
+    collapse at threads = nproc</strong>; under 100&nbsp;K
+    ops/sec, orders of magnitude worse than the rest. FIFO +
+    preemption: descheduled holder = stalled queue. Non-FIFO
+    spinlocks handle oversubscription fine because any free
+    observation can win the race.
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Building a baseline lock that matches pthread</h2>
+
+<p class="indent">
+    Pthread wins at high thread counts, spinlocks win at low ones.
+    Question: how much of pthread's win is the futex/blocking
+    <em>idea</em> vs glibc's specific <em>implementation</em>? We
+    wrote <code>FutexLock</code> (<code>src/sync/futex_lock.cpp</code>)
+    to find out: a 50-line three-state futex mutex, no libpthread.
+    State &isin; {0=unlocked, 1=locked, 2=locked-with-waiters}.
+    Fast path: one CAS 0&rarr;1. Slow path: spin 64 &times;
+    <code>pause</code>, then <code>FUTEX_WAIT_PRIVATE</code>.
+    Release: <code>fetch_sub</code>, and
+    <code>FUTEX_WAKE_PRIVATE</code> only if there were waiters.
+    Compared against <code>pthread_mutex</code> on both GHC and PSC.
+</p>
+
+<div class="plot-grid-2col" id="pthread-uncontended">
+    <img src="static/ghc/plots/pthread_compare_uncontended.png" alt="GHC uncontended acquire latency: 11.2 ns vs 21.8 ns">
+    <img src="static/psc/plots/pthread_compare_uncontended.png" alt="PSC uncontended acquire latency: 12.2 ns vs 12.2 ns">
+</div>
+<p class="indent">
+    <strong>Uncontended fast path is platform-dependent.</strong>
+    GHC (older glibc): FutexLock 11.2&nbsp;ns vs pthread 21.8&nbsp;ns
+   ; we beat pthread ~2&times;. The gap is glibc's libgcc
+    indirection and per-entry kind/robustness/recursion checks; the
+    futex primitive itself is identical. PSC (newer glibc): both at
+    12.2&nbsp;ns. PSC's glibc has trimmed that overhead. So "we
+    beat pthread 2&times;" only holds on GHC.
+</p>
+
+<p class="indent">
+    <strong>Throughput, GHC, four CS values.</strong>
+</p>
+<div class="plot-grid-2x2" id="pthread-ghc-throughput">
+    <img src="static/ghc/plots/pthread_compare_throughput_cs0.png" alt="GHC throughput, cs=0">
+    <img src="static/ghc/plots/pthread_compare_throughput_cs100.png" alt="GHC throughput, cs=100ns">
+    <img src="static/ghc/plots/pthread_compare_throughput_cs1000.png" alt="GHC throughput, cs=1us">
+    <img src="static/ghc/plots/pthread_compare_throughput_cs10000.png" alt="GHC throughput, cs=10us">
+</div>
+<p class="indent">
+    cs=0: FutexLock leads at low P, pthread overtakes from 4 threads
+    on. cs=100&nbsp;ns and cs=1&nbsp;&micro;s: FutexLock 5&ndash;25%
+    faster (4.2&nbsp;M vs 3.5&nbsp;M at 8/100ns; 870&nbsp;K vs
+    690&nbsp;K at 8/1&micro;s). cs=10&nbsp;&micro;s: tied within 1%,
+    held-time bound.
+</p>
+
+<p class="indent">
+    <strong>Throughput, PSC, four CS values.</strong>
+</p>
+<div class="plot-grid-2x2" id="pthread-psc-throughput">
+    <img src="static/psc/plots/pthread_compare_throughput_cs0.png" alt="PSC throughput, cs=0">
+    <img src="static/psc/plots/pthread_compare_throughput_cs100.png" alt="PSC throughput, cs=100ns">
+    <img src="static/psc/plots/pthread_compare_throughput_cs1000.png" alt="PSC throughput, cs=1us">
+    <img src="static/psc/plots/pthread_compare_throughput_cs10000.png" alt="PSC throughput, cs=10us">
+</div>
+<p class="indent">
+    cs=0: tied to 2 threads, pthread ~1.4&times; ahead from 4
+    onward out to 128. The dip-and-recover around 16 is glibc's
+    adaptive spin switching regimes. FutexLock flatlines at
+    ~10&nbsp;M ops/sec from 8 threads. cs=100&nbsp;ns: tracks
+    closely. cs=1&nbsp;&micro;s and 10&nbsp;&micro;s: FutexLock
+    slightly ahead at most P.
+</p>
+
+<p class="indent">
+    <strong>HW counters at cs=0, GHC.</strong>
+</p>
+<div class="plot-grid-2x2" id="pthread-ghc-counters">
+    <img src="static/ghc/plots/pthread_compare_cycles_per_acquire.png" alt="GHC cycles per acquire, cs=0">
+    <img src="static/ghc/plots/pthread_compare_instructions_per_acquire.png" alt="GHC instructions per acquire, cs=0">
+    <img src="static/ghc/plots/pthread_compare_misses_per_acquire.png" alt="GHC L1d misses per acquire, cs=0">
+    <img src="static/ghc/plots/pthread_compare_llc_per_acquire.png" alt="GHC LLC misses per acquire, cs=0">
+</div>
+<p class="indent">
+    Cycles: FutexLock burns 1700 at 4 threads, 4000 at 8; pthread
+    stays at 170&ndash;380. The 64-iteration spin budget is the
+    culprit; spinners never see unlock at cs=0, so the
+    budget is pure waste before <code>futex_wait</code>.
+    Instructions: <em>fewer</em> for FutexLock (35&ndash;90 vs
+    80&ndash;100), so cycles are stalled on coherence, not
+    retiring. L1d: ~4&times; more for FutexLock (re-reading state).
+    LLC: pthread ~4&times; higher (<code>FUTEX_WAKE</code> hits
+    cross-core scheduler state).
+</p>
+
+<p class="indent">
+    <strong>HW counters at cs=0, PSC.</strong>
+</p>
+<div class="plot-grid-2x2" id="pthread-psc-counters">
+    <img src="static/psc/plots/pthread_compare_cycles_per_acquire.png" alt="PSC cycles per acquire, cs=0">
+    <img src="static/psc/plots/pthread_compare_instructions_per_acquire.png" alt="PSC instructions per acquire, cs=0">
+    <img src="static/psc/plots/pthread_compare_misses_per_acquire.png" alt="PSC L1d misses per acquire, cs=0">
+    <img src="static/psc/plots/pthread_compare_llc_per_acquire.png" alt="PSC LLC misses per acquire, cs=0">
+</div>
+<p class="indent">
+    Same pattern, larger gap. From 16 threads on, FutexLock
+    is ~5&ndash;6&times; more cycles per acquire; pthread stays
+    flat ~150 cycles. L1d/LLC tradeoff preserved on Zen 2: more
+    L1d traffic from spinning, less LLC since we don't pay the
+    cross-socket wakeup. PSC makes the spin-budget loss louder.
+    This is where glibc's adaptive spinning earns its keep.
+</p>
+
+<p class="indent">
+    <strong>Verdict.</strong> A 50-line lock built directly on
+    <code>SYS_futex</code> matches or beats glibc's
+    <code>pthread_mutex</code> on every regime where the critical
+    section does any work, on both GHC and PSC. On GHC we even
+    beat pthread by ~2&times; on the uncontended fast path; on
+    PSC the fast paths are tied because glibc's overhead has been
+    tuned down for high-core-count machines. The one regime where
+    we consistently lose is cs=0 with many threads: glibc's
+    adaptive spinning transitions to <code>futex_wait</code> much
+    sooner than our fixed 64-iteration budget, so contended
+    threads burn fewer cycles before sleeping. <em>Most of
+    pthread's perf comes from the futex idea (~50&nbsp;LoC to
+    implement) and the rest from a single piece of production
+    engineering: adaptive spin tuning.</em> The architectural
+    choice (block vs spin) carries the day, not the specific
+    glibc implementation.
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Barriers</h2>
+
+<div class="plot-grid-2x2">
+    <img src="static/ghc/plots/barrier_latency.png" alt="Barrier latency">
+    <img src="static/ghc/plots/barrier_scalability.png" alt="Barrier scalability">
+    <img src="static/ghc/plots/barrier_cycles_per_barrier.png" alt="Cycles per barrier">
+    <img src="static/ghc/plots/barrier_ipc.png" alt="Barrier IPC">
+</div>
+<p class="indent">
+    Latency rises with threads for both. Tree wins at higher P
+    because per-phase cost is <em>O</em>(log P) vs sense's
+    <em>O</em>(P). The scalability plot divides by thread count:
+    tree flattens, sense grows. Cycles per barrier tracks the
+    same shape. IPC: tree spins more efficiently than sense, but
+    neither does useful work; it's all spin overhead.
+</p>
+<div class="plot-grid-2col">
+    <img src="static/ghc/plots/barrier_cache_misses_stacked.png" alt="Barrier read vs write misses">
+    <img src="static/ghc/plots/barrier_llc_misses.png" alt="Barrier LLC misses">
+</div>
+<p class="indent">
+    Cache view: sense's centralized counter is write-invalidation
+    dominated; every increment ages all other cores'
+    copies. Tree's per-thread spin is mostly reads. LLC: sense
+    generates roughly 10&times; more cross-core traffic than tree
+    under contention.
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Reductions</h2>
+
+<div class="plot-grid-2x2">
+    <img src="static/ghc/plots/reduction_latency.png" alt="Reduction per-call latency">
+    <img src="static/ghc/plots/reduction_speedup.png" alt="Tree-vs-linear reduction speedup">
+    <img src="static/ghc/plots/reduction_cycles_per_reduction.png" alt="Master-thread cycles per reduction">
+    <img src="static/ghc/plots/reduction_ipc.png" alt="Master IPC during reductions">
+</div>
+<p class="indent">
+    Workload: long-long integer sums, trivial combine.
+    <strong>Linear beats tree at every thread count up to
+    nproc.</strong> Math: linear costs <em>N</em> &times;
+    combine_cost; tree costs log&nbsp;<em>P</em> &times;
+    barrier_cost. Our combine is ~1&nbsp;ns (integer add); our
+    barrier is ~500&nbsp;ns (<code>pthread_barrier_wait</code>).
+    Crossover at <em>N</em>&nbsp;&asymp;&nbsp;500; well
+    above any reasonable thread count for cheap combines. Tree
+    only wins with expensive combines or very large <em>P</em>;
+    we vary both in the cross-machine section.
+</p>
+<p class="indent">
+    The cycle plots show where the cost goes: tree's master
+    burns cycles in barrier waits (low IPC); linear's master
+    is in a tight add loop (high IPC). Tree is ~3&times; more
+    master cycles for the same work.
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Applications and GOMP comparison</h2>
+
+<p class="indent">
+    <strong>Pi.</strong> Embarrassingly parallel, independent
+    per-thread RNG. All three schedulers cluster near ideal ;
+    nothing to load-balance. vs GOMP: our static is competitive;
+    GOMP's dynamic is slightly faster (chunk-stealing vs our
+    single shared <code>fetch_add</code>).
+</p>
+<div class="plot-grid-2col">
+    <img src="static/ghc/plots/pi_speedup.png" alt="Pi speedup, omp0 schedulers">
+    <img src="static/ghc/plots/pi_gomp_speedup.png" alt="Pi speedup vs GOMP">
+</div>
+<p class="indent">
+    <strong>Matmul (256&times;256).</strong> ~4&ndash;5&times; at
+    8 threads. Static and dynamic track each other; row-level work
+    is uniform. Cache-bound at this size; bigger N would scale
+    further.
+</p>
+<div class="plot-grid-2col">
+    <img src="static/ghc/plots/matmul_speedup.png" alt="Matmul speedup">
+    <img src="static/ghc/plots/matmul_gomp_speedup.png" alt="Matmul vs GOMP">
+</div>
+<p class="indent">
+    <strong>Mandelbrot.</strong> Per-row work is highly imbalanced
+    (boundary pixels need up to 500 iters; exterior bails out
+    fast). At 8 threads: <strong>dynamic ~7.5&times; (near-ideal),
+    guided ~4&times;, static ~2&times;</strong>. Only dynamic
+    chunk-stealing handles the imbalance.
+</p>
+<div class="plot-grid-2col">
+    <img src="static/ghc/plots/mandelbrot_speedup.png" alt="Mandelbrot speedup">
+    <img src="static/ghc/plots/mandelbrot_gomp_speedup.png" alt="Mandelbrot vs GOMP">
+</div>
+<div class="plot-grid-2col">
+    <img src="static/ghc/plots/pi_pinning.png" alt="Pi pinned vs unpinned">
+    <img src="static/ghc/plots/mandelbrot_pinning.png" alt="Mandelbrot pinned vs unpinned">
+</div>
+<p class="indent">
+    <strong>Pinning.</strong> Two stories: Mandelbrot benefits
+    (chunked iteration has cache locality to protect, OS
+    migration mid-chunk hurts). Pi is slightly slower with
+    pinning (no shared cache pressure; affinity just prevents
+    migration off a busy core). Pinning helps only when the
+    workload has memory locality.
+</p>
+<p class="indent">
+    <strong>Bug we hit.</strong> First speedup run showed every
+    variant flat at ~1&times;. Cause: sticky pinning.
+    <code>pthread_setaffinity_np</code> is persistent per-thread
+    and inherited at thread create. The bench loops
+    <code>{nopin, pin}</code> per scheduler. After the first
+    <code>pin=true</code> iter pinned master to core 0, every
+    later <code>pin=false</code> iter spawned workers that
+    inherited the affinity; the whole team serialized on
+    core 0. Fix: explicitly reset affinity in
+    <code>ThreadPool</code> construction and in worker startup.
+</p>
+<p class="indent">
+    GHC at 8 cores shows pthread is <em>not</em> fastest on short
+    CS. PSC at 128 inverts that. Discussed in the cross-machine
+    section.
+</p>
+
+<h1>PSC RESULTS (BRIDGES-2 EPYC 7742, 128 CORES)</h1>
+
+<p class="indent">
+    Dual-socket EPYC 7742, 128 cores. The app kernels follow the
+    same pattern as GHC (dynamic dominates Mandelbrot, static
+    dominates matmul, all three converge on Pi), just stretched to
+    128 threads; not reproduced here. The interesting PSC
+    results are the lock and barrier sweeps: 128 contending
+    threads across two sockets exposes coherence behavior the
+    8-core box can't.
+</p>
+
+<p class="indent">
+    <strong>Lock throughput at high contention is where Bridges-2
+    is most informative.</strong> The throughput plots at cs=0
+    and cs=10&nbsp;&micro;s on the left and right show the two
+    ends of the workload spectrum at 128 threads.
+</p>
+<div class="plot-grid-2col" id="psc-lock-throughput">
+    <img src="static/psc/plots/lock_throughput_cs0.png" alt="PSC lock throughput, cs=0">
+    <img src="static/psc/plots/lock_throughput_cs10000.png" alt="PSC lock throughput, cs=10us">
+</div>
+<p class="indent">
+    At 128 threads, cs=0, the rank order finally inverts compared
+    to GHC: <strong>pthread holds at ~9&nbsp;M ops/sec, while
+    ticket and MCS collapse to under 0.5&nbsp;M</strong> ;
+    a ~30&times; gap. TTAS and TTAS-yield sit around 5&nbsp;M;
+    TAS degrades to ~0.4&nbsp;M because every spin is a write
+    storm at this contention. The cache-coherence cost of any
+    spinlock at 128 threads now exceeds the cost of a Linux
+    futex roundtrip (~500&nbsp;ns on bare-metal AMD), so pthread
+    wins decisively. With a 10&nbsp;&micro;s critical section
+    everyone is bounded by held-time, but ticket and MCS still
+    collapse at 128 threads to ~0.015&nbsp;M (the FIFO-queue +
+    preemption cliff), 5&times; worse than the non-FIFO variants;
+    pthread holds steady throughout, a small constant cost from
+    futex wakeups but no collapse. <em>The lock that wins
+    changes with the platform's futex-cost-versus-coherence-cost
+    ratio</em>, exactly the GHC finding flipped the other way.
+</p>
+
+<p class="indent">
+    <strong>Cycle accounting and L1d/LLC traffic at high
+    contention.</strong> The 2&times;2 below covers per-acquire
+    cycles, per-cycle L1d miss rate, total LLC misses, and
+    per-cycle LLC miss rate at 128 threads.
+</p>
+<div class="plot-grid-2x2">
+    <img src="static/psc/plots/lock_cycles_per_acquire.png" alt="PSC cycles per acquire">
+    <img src="static/psc/plots/lock_miss_rate.png" alt="PSC L1d miss rate per cycle">
+    <img src="static/psc/plots/lock_llc_misses_vs_threads.png" alt="PSC LLC misses by lock variant">
+    <img src="static/psc/plots/lock_llc_miss_rate.png" alt="PSC LLC miss rate per cycle">
+</div>
+<p class="indent">
+    The GHC story scaled to 128 threads. Pthread: lowest
+    cycles-per-acquire (sleeps), highest miss-rate-per-cycle (few
+    active cycles, all near cold futex transitions). MCS / ticket:
+    many cycles, all L1-resident spin. LLC misses are where the
+    cross-socket traffic shows up: ticket and TAS ride the fabric
+    hard at 128 threads; MCS stays low (private node memory);
+    pthread near zero (sleeps). The per-cycle LLC rate is the
+    cleanest read; rate of cross-socket traffic per unit
+    CPU time.
+</p>
+
+<img src="static/psc/plots/lock_cache_misses_stacked.png" alt="PSC L1d misses by lock variant at 128 threads">
+<p class="indent">
+    Total L1d misses at 128 threads. Ticket dominates at
+    ~410&nbsp;M, TAS at ~325&nbsp;M, MCS at ~22&nbsp;M, pthread
+    at ~2&nbsp;M. The 15&times; ratio between TAS/ticket and MCS
+    is the fundamental MCS argument: spin on private nodes,
+    write only the successor's line, and you generate
+    proportionally less L1d traffic than the cache-line-bouncing
+    spin variants.
+</p>
+
+<div class="plot-grid-3col">
+    <img src="static/psc/plots/barrier_latency.png" alt="PSC barrier latency">
+    <img src="static/psc/plots/barrier_cache_misses_stacked.png" alt="PSC barrier MESI stacked">
+    <img src="static/psc/plots/barrier_llc_misses.png" alt="PSC barrier LLC misses">
+</div>
+<p class="indent">
+    Barriers on PSC reach thousands of ns at 128 threads. Tree
+    wins in the 16&ndash;64 thread range (its algorithmic sweet
+    spot); they converge at 128 where the broadcast cost
+    dominates either way. The MESI breakdown matches the lock
+    pattern: sense's centralized counter generates many
+    invalidations per event; tree's per-thread spin is mostly
+    reads.
+</p>
+
+<h1>CROSS-MACHINE COMPARISON</h1>
+
+<p class="indent">
+    Two stories need both platforms: the lock ranking inverts
+    between GHC and PSC, and the reduction crossover depends on
+    <em>P</em> and the barrier implementation across the full
+    thread range. "What limited the speedup" at the end folds
+    in both sides.
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Lock choice flips between platforms</h2>
+<p class="indent">
+    GHC, 8 cores, short CS: pthread is <em>not</em> fastest.
+    Pthread acquires are a libgcc call (~19&nbsp;ns uncontended);
+    spinlocks inline to one atomic (~8&nbsp;ns). Spinlocks win
+    until cache-line bouncing costs more than a futex roundtrip.
+</p>
+<p class="indent">
+    PSC, 128 cores: ranking flips. The
+    <a href="#psc-lock-throughput">PSC throughput plot</a>
+    has pthread at ~9&nbsp;M ops/sec while ticket and MCS collapse
+    to under 0.5&nbsp;M; a ~30&times; gap. Coherence cost
+    on 128 cores exceeds the futex roundtrip (~500&nbsp;ns on AMD).
+</p>
+<p class="indent">
+    Conclusion: spinlocks for the small-machine, short-CS regime;
+    pthread for large-machine, high-contention. FIFO spinlocks
+    (ticket, MCS) lose anywhere preemption is possible. The
+    textbook rule "spinlocks beat mutexes for short CS" needs
+    the qualifier "on small machines."
+</p>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">Reduction crossover: combine cost vs barrier impl</h2>
+
+<p class="indent">
+    <code>reduction_combine_bench</code> parameterizes the combine
+    op with <em>W</em> LCG iterations per call. Small <em>W</em>
+    models a cheap add; large <em>W</em> models an expensive
+    merge (sorted-list union, histogram, vector reduction). Three
+    variants:
+</p>
+<ul class="indent" style="margin-left: 7ch;">
+    <li><strong>linear</strong>; master does <em>P</em>
+        sequential combines.</li>
+    <li><strong>tree (pthread_barrier)</strong>; our
+        Runtime's tree reduce, one
+        <code>pthread_barrier_t</code> per stride.</li>
+    <li><strong>tree (userspace spin)</strong>; same
+        algorithm with an inline one-shot spin barrier.</li>
+</ul>
+
+<img src="static/ghc/plots/reduction_combine_crossover.png" alt="GHC reduction crossover panels" class="plot-wide" id="ghc-reduction-crossover">
+<p class="indent">
+    GHC (8 cores). Linear: flat at low <em>W</em>
+    (~1&ndash;5&nbsp;&micro;s, dominated by
+    <code>ThreadPool::run</code> overhead), grows as
+    <em>P&middot;W</em>. Tree-userspace tracks linear at low
+    <em>W</em>, slope is <em>log&nbsp;P&middot;W</em>, separates
+    as <em>W</em> grows. Tree-pthread is ~5&times; above
+    tree-userspace at low <em>W</em>; pure kernel barrier
+    overhead. At <em>P</em>=8: tree-userspace beats linear from
+    <em>W</em>&nbsp;&asymp;&nbsp;1000 (~1&nbsp;&micro;s combine);
+    tree-pthread only catches linear at <em>W</em>&nbsp;&asymp;&nbsp;65k.
+    At <em>P</em>=2 nothing beats linear (one barrier per combine,
+    overhead never amortizes).
+</p>
+
+<img src="static/psc/plots/reduction_combine_crossover.png" alt="PSC reduction crossover panels" class="plot-wide" id="psc-reduction-crossover">
+<img src="static/psc/plots/reduction_combine_ratio.png" alt="PSC tree/linear ratio vs combine work" class="plot-wide" id="psc-reduction-ratio">
+<p class="indent">
+    PSC (128 cores). The <em>P</em> vs log&nbsp;<em>P</em> gap
+    opens up: at <em>P</em>=128, linear does 128 combines, tree
+    does 7. The ratio plot shows tree-userspace dropping below
+    1.0 (= faster than linear) across more of the <em>W</em>
+    range as <em>P</em> grows. Tree-pthread does the opposite
+   ; kernel barrier cost balloons at 128 threads, so
+    those dashed lines stay an order of magnitude above 1.0 even
+    at <em>W</em>=65k. Implementation matters more than algorithm
+    here.
+</p>
+<p class="indent">
+    Three takeaways:
+</p>
+<ol class="indent" style="margin-left: 7ch;">
+    <li>Cheap combine (integer sum): linear always wins at any
+        <em>P</em> we tested.</li>
+    <li>Expensive combine: tree wins at moderate-to-large
+        <em>P</em>; crossover drops as <em>P</em> grows.</li>
+    <li>Tree's win depends on the barrier implementation as
+        much as the algorithm. Our Runtime uses
+        <code>pthread_barrier_t</code> (kernel/futex) for
+        correctness reasons; userspace one-shot spin barriers
+        get the algorithmic win at the cost of breaking under
+        oversubscription.</li>
+</ol>
+
+<h2 style="margin-left: 7ch; font-family: monospace; font-size: 14px; text-transform: uppercase;">What limited the speedup</h2>
+
+<p class="indent">
+    Apps: synchronization overhead (Pi:
+    <code>fetch_add</code> on the dynamic counter), thread placement
+    (matmul mid-count dips), and OS migration noise (Mandelbrot,
+    hence the 6&times; pinning win). Sync primitives:
+    cache-coherence traffic (lock_throughput_cs0 inflection), futex
+    roundtrip cost (pthread loses on short CS), FIFO + preemption
+    stalls (ticket/MCS oversubscription cliff), and
+    combine-vs-barrier ratio (tree reduction only beats linear
+    when combine &gt; barrier; see the crossover above). HW
+    counters confirm the cycle/cache breakdown each time.
+</p>
+<p class="indent">
+    CPU was the right substrate; the project is about
+    sync-primitive tradeoffs and cache coherence. A GPU would
+    have hidden the effects we wanted to measure: different
+    memory model, no per-thread futex, no userspace locks.
+</p>
+
+<h1>WHAT WE DIDN'T DO</h1>
+<p class="indent">
+    The proposal listed a "hope-to-achieve" source-to-source
+    compiler that would translate <code>#pragma omp</code>
+    directives into omp0 API calls. We did not build this; it
+    was always a stretch goal and the runtime + analysis work
+    already filled the schedule. The implication is that omp0 is
+    a runtime library you call directly, not a drop-in
+    replacement for libgomp at the source level.
+</p>
+
+<h1>REFERENCES</h1>
+<ul>
+    <li>OpenMP Architecture Review Board,
+        <em>OpenMP Application Programming Interface</em>,
+        version&nbsp;5.0, 2018. (For the API surface we
+        implemented.)</li>
+    <li>Linux kernel
+        <a href="https://man7.org/linux/man-pages/man2/perf_event_open.2.html">
+        perf_event_open(2)</a> and
+        <a href="https://man7.org/linux/man-pages/man2/futex.2.html">futex(2)</a>
+        man pages.</li>
+    <li>Drepper,
+        <em>What every programmer should know about memory</em>,
+        Red Hat, 2007. (For MESI / cache-coherence background.)</li>
+</ul>
+
+<h1>WORK DISTRIBUTION (50% / 50%)</h1>
+<p class="indent">
+    Both of us worked on essentially every part of the project
+    together; design, implementation, debugging, runs,
+    plots, and the writeup. We paired on most of the harder
+    pieces (the AMD perf-counter rewrite, the ThreadPool race fix,
+    the reduction barrier hunt). Splitting credit cleanly is
+    artificial here: this was a genuinely shared effort, ~50/50.
+</p>
 
 <h1>SEE ALSO</h1>
 <p class="indent">
-    <a href="index.html">← Back to project page</a>
+    <a href="proposal.html">Proposal</a>,
+    <a href="milestone.html">Milestone</a>,
+    <a href="index.html">project page</a>
 </p>
 
 <div class="man-footer">
